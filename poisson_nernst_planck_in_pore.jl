@@ -11,8 +11,8 @@ import LiquidCrystals as LC
 # --------------------------
 # Geometry / grid
 # --------------------------
-const L = 5.0e-5
-const a = 1.0e-5
+const L = 5.0e-5 #um
+const a = 1.0e-5 #um
 const Nx = 160
 const Ny = 40
 const dx = L/(Nx-1)
@@ -21,15 +21,15 @@ const dy = a/(Ny-1)
 # --------------------------
 # Transport / constants
 # --------------------------
-const Dp = 1e-11
-const Dm = 1e-11
+const Dp = 1e-11 #m^2 / s
+const Dm = 1e-11 #m^2 / s
 
-const e  = 1.602176634e-19
-const kB = 1.380649e-23
-const T  = 273.15
+const e  = 1.602176634e-19 # C
+const kB = 1.380649e-23 # J / K
+const T  = 273.15 # K
 const beta = e/(kB*T)                 # 1/V
 
-const eps0 = 8.8541878128e-12
+const eps0 = 8.8541878128e-12 # F / m
 const epsr = 80.0                      # example (water-like); set as needed
 const eps  = epsr * eps0
 
@@ -58,7 +58,7 @@ lap = LC.CenteredDifference{LC.Laplacian}((dx,dy))
 # --------------------------
 # Species: Dirichlet in x, (we will override y ghosts to enforce NP no-flux)
 bc_c = LC.BoxBC((
-    LC.DirichletAxisBC{LC.XAxis}(0.0, 0.0),
+    LC.DirichletAxisBC{LC.XAxis}(1.0, 1.0),
     LC.NeumannAxisBC{LC.YAxis}(0.0, 0.0),   # dummy; we'll overwrite y-ghosts for NP
 ))
 
@@ -131,30 +131,65 @@ end
 # -eps * Lap(phi) = e (cp - cm)
 # --------------------------
 function solve_poisson_SOR!(phi::AbstractMatrix, cp::AbstractMatrix, cm::AbstractMatrix,
-                            bc_phi, phi_ext::AbstractMatrix, eps::Float64, echarge::Float64,
+                            phi0::Float64, phiL::Float64, qwall::Float64,
+                            eps::Float64, echarge::Float64,
                             dx::Float64, dy::Float64;
                             ω::Float64=1.7, maxiter::Int=400, tol::Float64=1e-8)
 
     dx2 = dx*dx
     dy2 = dy*dy
-    inv_denom = 1.0/(2.0/dx2 + 2.0/dy2)
+    inv_denom = 1.0 / (2.0/dx2 + 2.0/dy2)
+
+    # wall-normal y-derivatives implied by -eps * ∂n phi = qwall
+    dphidy_bottom =  qwall / eps    # at y = 0
+    dphidy_top    = -qwall / eps    # at y = a
 
     for it in 1:maxiter
-        # enforce phi BCs into ghost cells so boundary behavior stays consistent
-        LC.apply_BCs(lap, phi, bc_phi, phi_ext)
 
+        # ------------------------------------------
+        # Enforce boundary conditions on phi
+        # ------------------------------------------
+
+        # Dirichlet at x = 0 and x = L
+        @inbounds for j in 1:Ny
+            phi[1,  j] = phi0
+            phi[Nx, j] = phiL
+        end
+
+        # Neumann at y = 0 and y = a
+        @inbounds for i in 2:Nx-1
+            phi[i, 1]  = phi[i, 2]    - dy * dphidy_bottom
+            phi[i, Ny] = phi[i, Ny-1] + dy * dphidy_top
+        end
+
+        # corners: make them consistent with x-Dirichlet
+        phi[1,1]   = phi0
+        phi[1,Ny]  = phi0
+        phi[Nx,1]  = phiL
+        phi[Nx,Ny] = phiL
+
+        # ------------------------------------------
+        # SOR update on interior nodes
+        # ------------------------------------------
         maxupd = 0.0
+
         @inbounds for j in 2:Ny-1, i in 2:Nx-1
-            rhs = -(echarge/eps) * (cp[i,j] - cm[i,j])  # Lap(phi) = rhs
-            phi_new = ((phi[i+1,j] + phi[i-1,j])/dx2 + (phi[i,j+1] + phi[i,j-1])/dy2 - rhs) * inv_denom
-            upd = ω*(phi_new - phi[i,j])
+            rhs = -(echarge / eps) * (cp[i,j] - cm[i,j])
+
+            phi_new = ((phi[i+1,j] + phi[i-1,j]) / dx2 +
+                       (phi[i,j+1] + phi[i,j-1]) / dy2 -
+                       rhs) * inv_denom
+
+            upd = ω * (phi_new - phi[i,j])
             phi[i,j] += upd
             maxupd = max(maxupd, abs(upd))
         end
+
         if maxupd < tol
             return it
         end
     end
+
     return maxiter
 end
 
@@ -174,7 +209,10 @@ function rhs_pnp!(du, u, p, t)
     cm  = @view u[:,:,2];  dcm = @view du[:,:,2]
 
     # --- Solve Poisson for phi given current cp,cm ---
-    solve_poisson_SOR!(phi, cp, cm, bc_phi, phi_ext, eps, echarge, dx, dy; ω=1.7, maxiter=400, tol=1e-8)
+    solve_poisson_SOR!(phi, cp, cm,
+                   phi0, phiL, qwall,
+                   eps, e, dx, dy;
+                   ω=1.7, maxiter=400, tol=1e-8)
 
     # Fill ghost cells for phi and compute grad(phi) on extended grid
     LC.apply_BCs(grad, phi, bc_phi, phi_ext)
@@ -241,9 +279,10 @@ println("Final charge density range (cp-cm): ", extrema(cp_final .- cm_final))
 # ------------------------------------------------
 function solve_poisson_frame!(phi_frame::AbstractMatrix, cp::AbstractMatrix, cm::AbstractMatrix)
     # reuse the same BCs + caches as in the simulation
-    solve_poisson_SOR!(phi_frame, cp, cm, bc_phi, phi_ext,
-                       eps, e, dx, dy;
-                       ω=1.7, maxiter=400, tol=1e-8)
+        solve_poisson_SOR!(phi, cp, cm,
+                   phi0, phiL, qwall,
+                   eps, e, dx, dy;
+                   ω=1.7, maxiter=400, tol=1e-8)
     return nothing
 end
 
